@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// プロトコルメッセージ（4種類のみ）
+/// JSON形式でシリアライズされ、言語非依存
 #[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type")]
 pub enum Message {
     /// クライアント → サーバー: トンネル作成リクエスト
     TunnelRequest { local_port: u16 },
@@ -20,18 +22,22 @@ pub enum Message {
 
 impl Message {
     /// メッセージを送信
-    /// フォーマット: [length: u32][data: bytes]
+    /// フォーマット: [length: u32 little-endian][json_data: UTF-8 bytes]
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
-        let data = bincode::serialize(self)
-            .with_context(|| format!("Failed to serialize message: {:?}", self))?;
+        // JSONに変換
+        let json = serde_json::to_string(self)
+            .with_context(|| format!("Failed to serialize message to JSON: {:?}", self))?;
+        let data = json.as_bytes();
 
+        // length (u32, little-endian)
         writer
-            .write_u32(data.len() as u32)
+            .write_u32_le(data.len() as u32)
             .await
             .with_context(|| "Failed to write message length")?;
 
+        // JSON data
         writer
-            .write_all(&data)
+            .write_all(data)
             .await
             .with_context(|| "Failed to write message data")?;
 
@@ -42,8 +48,9 @@ impl Message {
 
     /// メッセージを受信
     pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
+        // length (u32, little-endian)
         let len = reader
-            .read_u32()
+            .read_u32_le()
             .await
             .with_context(|| "Failed to read message length")?;
 
@@ -52,14 +59,19 @@ impl Message {
             anyhow::bail!("Message too large: {} bytes", len);
         }
 
+        // JSON data
         let mut buf = vec![0u8; len as usize];
         reader
             .read_exact(&mut buf)
             .await
             .with_context(|| "Failed to read message data")?;
 
-        let msg = bincode::deserialize(&buf)
-            .with_context(|| "Failed to deserialize message")?;
+        // JSONからデシリアライズ
+        let json = String::from_utf8(buf)
+            .with_context(|| "Failed to convert message data to UTF-8")?;
+
+        let msg = serde_json::from_str(&json)
+            .with_context(|| format!("Failed to deserialize JSON: {}", json))?;
 
         Ok(msg)
     }
@@ -68,7 +80,6 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
     async fn test_message_roundtrip() {
@@ -99,5 +110,22 @@ mod tests {
                 _ => panic!("Message mismatch"),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_json_format() {
+        // JSONフォーマットが正しいか確認
+        let msg = Message::TunnelRequest { local_port: 8080 };
+        let mut buf = Vec::new();
+        msg.write_to(&mut buf).await.unwrap();
+
+        // lengthの4バイトをスキップしてJSON部分を取得
+        let json_data = &buf[4..];
+        let json_str = String::from_utf8(json_data.to_vec()).unwrap();
+
+        // JSONとしてパース可能か確認
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed["type"], "TunnelRequest");
+        assert_eq!(parsed["local_port"], 8080);
     }
 }
