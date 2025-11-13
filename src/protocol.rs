@@ -1,243 +1,103 @@
-pub const HASH_WIDTH_IN_BYTES: usize = 32;
-
-use anyhow::{bail, Context, Result};
-use bytes::{Bytes, BytesMut};
-use lazy_static::lazy_static;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::trace;
 
-type ProtocolVersion = u8;
-const _PROTO_V0: u8 = 0u8;
-const PROTO_V1: u8 = 1u8;
+/// プロトコルメッセージ（4種類のみ）
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum Message {
+    /// クライアント → サーバー: トンネル作成リクエスト
+    TunnelRequest { local_port: u16 },
 
-pub const CURRENT_PROTO_VERSION: ProtocolVersion = PROTO_V1;
+    /// サーバー → クライアント: 割り当てたポート番号
+    TunnelResponse { assigned_port: u16 },
 
-pub type Digest = [u8; HASH_WIDTH_IN_BYTES];
-
-#[derive(Deserialize, Serialize, Debug)]
-pub enum Hello {
-    ControlChannelHello(ProtocolVersion, Digest), // sha256sum(service name) or a nonce
-    DataChannelHello(ProtocolVersion, Digest),    // token provided by CreateDataChannel
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-pub struct Auth(pub Digest);
-
-#[derive(Deserialize, Serialize, Debug)]
-pub enum Ack {
-    Ok,
-    ServiceNotExist,
-    AuthFailed,
-}
-
-impl std::fmt::Display for Ack {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Ack::Ok => "Ok",
-                Ack::ServiceNotExist => "Service not exist",
-                Ack::AuthFailed => "Incorrect token",
-            }
-        )
-    }
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-pub enum ControlChannelCmd {
+    /// サーバー → クライアント: データチャネルを作成して
     CreateDataChannel,
-    HeartBeat,
+
+    /// 双方向: ハートビート
+    Heartbeat,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
-pub enum DataChannelCmd {
-    StartForwardTcp,
-    StartForwardUdp,
-}
+impl Message {
+    /// メッセージを送信
+    /// フォーマット: [length: u32][data: bytes]
+    pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
+        let data = bincode::serialize(self)
+            .with_context(|| format!("Failed to serialize message: {:?}", self))?;
 
-type UdpPacketLen = u16; // `u16` should be enough for any practical UDP traffic on the Internet
-#[derive(Deserialize, Serialize, Debug)]
-struct UdpHeader {
-    from: SocketAddr,
-    len: UdpPacketLen,
-}
+        writer
+            .write_u32(data.len() as u32)
+            .await
+            .with_context(|| "Failed to write message length")?;
 
-#[derive(Debug)]
-pub struct UdpTraffic {
-    pub from: SocketAddr,
-    pub data: Bytes,
-}
+        writer
+            .write_all(&data)
+            .await
+            .with_context(|| "Failed to write message data")?;
 
-impl UdpTraffic {
-    pub async fn write<T: AsyncWrite + Unpin>(&self, writer: &mut T) -> Result<()> {
-        let hdr = UdpHeader {
-            from: self.from,
-            len: self.data.len() as UdpPacketLen,
-        };
-
-        let v = bincode::serialize(&hdr).unwrap();
-
-        trace!("Write {:?} of length {}", hdr, v.len());
-        writer.write_u8(v.len() as u8).await?;
-        writer.write_all(&v).await?;
-
-        writer.write_all(&self.data).await?;
+        writer.flush().await?;
 
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub async fn write_slice<T: AsyncWrite + Unpin>(
-        writer: &mut T,
-        from: SocketAddr,
-        data: &[u8],
-    ) -> Result<()> {
-        let hdr = UdpHeader {
-            from,
-            len: data.len() as UdpPacketLen,
-        };
+    /// メッセージを受信
+    pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
+        let len = reader
+            .read_u32()
+            .await
+            .with_context(|| "Failed to read message length")?;
 
-        let v = bincode::serialize(&hdr).unwrap();
+        // メッセージが大きすぎる場合はエラー（DoS対策）
+        if len > 1024 * 1024 {
+            anyhow::bail!("Message too large: {} bytes", len);
+        }
 
-        trace!("Write {:?} of length {}", hdr, v.len());
-        writer.write_u8(v.len() as u8).await?;
-        writer.write_all(&v).await?;
-
-        writer.write_all(data).await?;
-
-        Ok(())
-    }
-
-    pub async fn read<T: AsyncRead + Unpin>(reader: &mut T, hdr_len: u8) -> Result<UdpTraffic> {
-        let mut buf = vec![0; hdr_len as usize];
+        let mut buf = vec![0u8; len as usize];
         reader
             .read_exact(&mut buf)
             .await
-            .with_context(|| "Failed to read udp header")?;
+            .with_context(|| "Failed to read message data")?;
 
-        let hdr: UdpHeader =
-            bincode::deserialize(&buf).with_context(|| "Failed to deserialize UdpHeader")?;
+        let msg = bincode::deserialize(&buf)
+            .with_context(|| "Failed to deserialize message")?;
 
-        trace!("hdr {:?}", hdr);
-
-        let mut data = BytesMut::new();
-        data.resize(hdr.len as usize, 0);
-        reader.read_exact(&mut data).await?;
-
-        Ok(UdpTraffic {
-            from: hdr.from,
-            data: data.freeze(),
-        })
+        Ok(msg)
     }
 }
 
-pub fn digest(data: &[u8]) -> Digest {
-    use sha2::{Digest, Sha256};
-    let d = Sha256::new().chain_update(data).finalize();
-    d.into()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct PacketLength {
-    hello: usize,
-    ack: usize,
-    auth: usize,
-    c_cmd: usize,
-    d_cmd: usize,
-}
+    #[tokio::test]
+    async fn test_message_roundtrip() {
+        let messages = vec![
+            Message::TunnelRequest { local_port: 8080 },
+            Message::TunnelResponse { assigned_port: 35100 },
+            Message::CreateDataChannel,
+            Message::Heartbeat,
+        ];
 
-impl PacketLength {
-    pub fn new() -> PacketLength {
-        let username = "default";
-        let d = digest(username.as_bytes());
-        let hello = bincode::serialized_size(&Hello::ControlChannelHello(CURRENT_PROTO_VERSION, d))
-            .unwrap() as usize;
-        let c_cmd =
-            bincode::serialized_size(&ControlChannelCmd::CreateDataChannel).unwrap() as usize;
-        let d_cmd = bincode::serialized_size(&DataChannelCmd::StartForwardTcp).unwrap() as usize;
-        let ack = Ack::Ok;
-        let ack = bincode::serialized_size(&ack).unwrap() as usize;
+        for msg in messages {
+            let mut buf = Vec::new();
+            msg.write_to(&mut buf).await.unwrap();
 
-        let auth = bincode::serialized_size(&Auth(d)).unwrap() as usize;
-        PacketLength {
-            hello,
-            ack,
-            auth,
-            c_cmd,
-            d_cmd,
-        }
-    }
-}
+            let mut cursor = std::io::Cursor::new(buf);
+            let decoded = Message::read_from(&mut cursor).await.unwrap();
 
-lazy_static! {
-    static ref PACKET_LEN: PacketLength = PacketLength::new();
-}
-
-pub async fn read_hello<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Hello> {
-    let mut buf = vec![0u8; PACKET_LEN.hello];
-    conn.read_exact(&mut buf)
-        .await
-        .with_context(|| "Failed to read hello")?;
-    let hello = bincode::deserialize(&buf).with_context(|| "Failed to deserialize hello")?;
-
-    match hello {
-        Hello::ControlChannelHello(v, _) => {
-            if v != CURRENT_PROTO_VERSION {
-                bail!(
-                    "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
-                    CURRENT_PROTO_VERSION,
-                    v
-                );
-            }
-        }
-        Hello::DataChannelHello(v, _) => {
-            if v != CURRENT_PROTO_VERSION {
-                bail!(
-                    "Protocol version mismatched. Expected {}, got {}. Please update `rathole`.",
-                    CURRENT_PROTO_VERSION,
-                    v
-                );
+            // メッセージが正しくエンコード/デコードされることを確認
+            match (msg, decoded) {
+                (Message::TunnelRequest { local_port: p1 }, Message::TunnelRequest { local_port: p2 }) => {
+                    assert_eq!(p1, p2);
+                }
+                (Message::TunnelResponse { assigned_port: p1 }, Message::TunnelResponse { assigned_port: p2 }) => {
+                    assert_eq!(p1, p2);
+                }
+                (Message::CreateDataChannel, Message::CreateDataChannel) => {}
+                (Message::Heartbeat, Message::Heartbeat) => {}
+                _ => panic!("Message mismatch"),
             }
         }
     }
-
-    Ok(hello)
-}
-
-pub async fn read_auth<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Auth> {
-    let mut buf = vec![0u8; PACKET_LEN.auth];
-    conn.read_exact(&mut buf)
-        .await
-        .with_context(|| "Failed to read auth")?;
-    bincode::deserialize(&buf).with_context(|| "Failed to deserialize auth")
-}
-
-pub async fn read_ack<T: AsyncRead + AsyncWrite + Unpin>(conn: &mut T) -> Result<Ack> {
-    let mut bytes = vec![0u8; PACKET_LEN.ack];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read ack")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize ack")
-}
-
-pub async fn read_control_cmd<T: AsyncRead + AsyncWrite + Unpin>(
-    conn: &mut T,
-) -> Result<ControlChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.c_cmd];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize control cmd")
-}
-
-pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
-    conn: &mut T,
-) -> Result<DataChannelCmd> {
-    let mut bytes = vec![0u8; PACKET_LEN.d_cmd];
-    conn.read_exact(&mut bytes)
-        .await
-        .with_context(|| "Failed to read cmd")?;
-    bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
 }
