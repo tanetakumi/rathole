@@ -132,15 +132,43 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+## Java Client
+
+This version uses **JSON protocol** which allows clients in other languages!
+
+A Java client implementation is available in `clients/java/`:
+
+```bash
+# Build Java client
+cd clients/java
+mvn clean package
+
+# Run Java client
+java -jar target/rathole-client.jar myserver.com 2333 8080
+```
+
+```java
+// Use as library in your Java project
+RatholeClient client = new RatholeClient("myserver.com", 2333, 8080);
+client.start();
+System.out.println("Remote port: " + client.getAssignedPort());
+```
+
+See [clients/java/README.md](clients/java/README.md) for detailed documentation.
+
+**Why JSON?** The protocol now uses JSON instead of Rust-specific bincode, making it easy to implement clients in any language (Python, Go, Node.js, etc.).
+
 ## Features
 
 ### What's Included
 - Simple CLI with no configuration files
+- **JSON protocol** - Language-independent, easy to implement in any language
 - Automatic port allocation (35100-35200 range)
 - Support for up to 100 concurrent clients
 - Automatic reconnection on failure
 - Heartbeat for connection health monitoring
 - Clean and readable codebase
+- **Java client included** - Full-featured Java implementation
 
 ### What's Removed (from original rathole)
 - TOML configuration system
